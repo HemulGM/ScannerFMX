@@ -27,3 +27,4 @@ Thumbs.db*
 *.~*
 *.dsv
 *.dsk
+/public_html
