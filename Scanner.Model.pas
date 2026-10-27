@@ -73,6 +73,17 @@ type
     FSkipped: Integer;
     FDone: Integer;
     FStartRequested: Boolean;
+    // A sub-scan reports progress and takes thread slots from the thread that owns the volume.
+    FOwner: TScanThread;
+    FFreeSlots: Integer;
+    FSubNode: TDiskNode;
+    FSubPath, FSubName: string;
+    FSubCluster: UInt64;
+    FSubDepth: Integer;
+    FSubExisting: Boolean;
+    FSubValues: TNodeValues;
+    constructor CreateSub(Owner: TScanThread; Node: TDiskNode; const Path, Name: string; Cluster: UInt64; Depth: Integer; Existing: Boolean);
+    function Cancelled: Boolean;
     function NewNode(const Path, Name: string; Parent: TDiskNode; IsFolder: Boolean): TDiskNode;
     function FindSource(const Path: string): TDiskNode;
     procedure StageNode(Node: TDiskNode; const Name: string; const Values: TNodeValues; Children: TObjectList<TDiskNode>; Existing: Boolean);
@@ -345,6 +356,64 @@ begin
   FCounting := False;
   FGroupProgress := -1;
   FLock := TCriticalSection.Create;
+  FOwner := Self;
+end;
+
+constructor TScanThread.CreateSub(Owner: TScanThread; Node: TDiskNode; const Path, Name: string; Cluster: UInt64; Depth: Integer; Existing: Boolean);
+begin
+  Create(nil, nil, nil, Owner.FSourceRoot);
+  FOwner := Owner;
+  FSubNode := Node;
+  FSubPath := Path;
+  FSubName := Name;
+  FSubCluster := Cluster;
+  FSubDepth := Depth;
+  FSubExisting := Existing;
+end;
+
+function TScanThread.Cancelled: Boolean;
+begin
+  Result := Terminated or FOwner.Terminated;
+end;
+
+const
+  // Only folders this close to the scan root are handed to other threads, so
+  // thread creation stays negligible next to the enumeration it parallelizes.
+  ParallelDepth = 6;
+  FIND_FIRST_EX_LARGE_FETCH = 2; // Missing from Winapi.Windows.
+
+function ParallelSlots(const Path: string): Integer;
+const
+  IOCTL_STORAGE_QUERY_PROPERTY = $2D1400;
+  StorageDeviceSeekPenaltyProperty = 7;
+var
+  Drive: string;
+  H: THandle;
+  Query: array[0..2] of DWORD;
+  Penalty: record
+    Version, Size: DWORD;
+    IncursSeekPenalty: Boolean;
+  end;
+  Returned: DWORD;
+begin
+  Result := Max(0, TThread.ProcessorCount - 1);
+  Drive := ExtractFileDrive(Path);
+  if GetDriveType(PChar(IncludeTrailingPathDelimiter(Drive))) = DRIVE_REMOTE then
+    Exit;
+  // Parallel enumeration makes rotating disks seek; unknown devices stay sequential too.
+  H := CreateFile(PChar('\\.\' + Drive), 0, FILE_SHARE_READ or FILE_SHARE_WRITE, nil, OPEN_EXISTING, 0, 0);
+  if H = INVALID_HANDLE_VALUE then
+    Exit(0);
+  try
+    Query[0] := StorageDeviceSeekPenaltyProperty;
+    Query[1] := 0; // PropertyStandardQuery
+    Query[2] := 0;
+    if not DeviceIoControl(H, IOCTL_STORAGE_QUERY_PROPERTY, @Query, SizeOf(Query),
+      @Penalty, SizeOf(Penalty), Returned, nil) or Penalty.IncursSeekPenalty then
+      Result := 0;
+  finally
+    CloseHandle(H)
+  end;
 end;
 
 destructor TScanThread.Destroy;
@@ -697,6 +766,17 @@ var
   List, PendingList: TObjectList<TDiskNode>;
   ChildValues: TNodeValues;
   ChildExists, IsFolder: Boolean;
+  Subs: TObjectList<TScanThread>;
+  Sub: TScanThread;
+  Visited, Bytes: UInt64;
+
+  function TakeSlot: Boolean;
+  begin
+    Result := TInterlocked.Decrement(FOwner.FFreeSlots) >= 0;
+    if not Result then
+      TInterlocked.Increment(FOwner.FFreeSlots);
+  end;
+
 begin
   Result := Default(TNodeValues);
   if Node.IsVolume then
@@ -704,8 +784,9 @@ begin
     Result.Capacity := Node.Capacity;
     Result.FreeSpace := Node.FreeSpace
   end;
-  if Terminated then
+  if Cancelled then
     Exit;
+  Subs := nil;
   List := Node.Children;
   if Existing then
     List := TObjectList<TDiskNode>.Create(False);
@@ -714,28 +795,32 @@ begin
       Result.Unreadable := True
     else
     begin
-      FLock.Enter;
+      FOwner.FLock.Enter;
       try
-        FCurrent := DirectoryPath;
+        FOwner.FCurrent := DirectoryPath;
       finally
-        FLock.Leave
+        FOwner.FLock.Leave
       end;
       Prefix := IncludeTrailingPathDelimiter(DirectoryPath);
-      Search := FindFirstFile(PChar(IncludeTrailingPathDelimiter(LongPath(DirectoryPath)) + '*'), Data);
+      // Basic info skips 8.3 names; large fetch reads more entries per call.
+      Search := FindFirstFileEx(PChar(IncludeTrailingPathDelimiter(LongPath(DirectoryPath)) + '*'),
+        FindExInfoBasic, @Data, FindExSearchNameMatch, nil, FIND_FIRST_EX_LARGE_FETCH);
       if Search = INVALID_HANDLE_VALUE then
       begin
         Result.Unreadable := True;
-        FLock.Enter;
+        FOwner.FLock.Enter;
         try
-          Inc(FSkipped);
+          Inc(FOwner.FSkipped);
         finally
-          FLock.Leave
+          FOwner.FLock.Leave
         end;
       end
       else
       try
+        Visited := 0;
+        Bytes := 0;
         repeat
-          if Terminated then
+          if Cancelled then
             Exit;
           ItemName := Data.cFileName;
           if (ItemName = '.') or (ItemName = '..') then
@@ -765,7 +850,29 @@ begin
           begin
             // Never follow junctions or symbolic directory links.
             if (Data.dwFileAttributes and FILE_ATTRIBUTE_REPARSE_POINT) = 0 then
+            begin
+              if (Depth < ParallelDepth) and TakeSlot then
+              begin
+                // The subtree is joined, and its values added, after this listing ends.
+                try
+                  Sub := TScanThread.CreateSub(FOwner, Child, ItemPath, ItemName, Cluster, Depth + 1, ChildExists);
+                except
+                  TInterlocked.Increment(FOwner.FFreeSlots);
+                  raise;
+                end;
+                if Subs = nil then
+                  Subs := TObjectList<TScanThread>.Create(True);
+                try
+                  Subs.Add(Sub);
+                except
+                  Sub.Free; // Runs cancelled and returns the slot.
+                  raise;
+                end;
+                Sub.Start;
+                Continue;
+              end;
               ChildValues := ScanDirectory(Child, ItemPath, Cluster, Depth + 1, ChildExists)
+            end
             else
             begin
               PendingList := nil;
@@ -794,23 +901,44 @@ begin
             ChildValues.LogicalSize := N;
             ChildValues.Files := 1;
             StageNode(Child, ItemName, ChildValues, nil, ChildExists);
-            FLock.Enter;
-            try
-              Inc(FVisited);
-              Inc(FTotalFiles);
-              Inc(FProcessedBytes, Physical);
-            finally
-              FLock.Leave
-            end;
+            Inc(Visited);
+            Inc(Bytes, Physical);
           end;
           Inc(Result.Size, ChildValues.Size);
           Inc(Result.LogicalSize, ChildValues.LogicalSize);
           Inc(Result.Files, ChildValues.Files);
         until not FindNextFile(Search, Data);
+        // One lock per folder: several threads may report to the same owner.
+        FOwner.FLock.Enter;
+        try
+          Inc(FOwner.FVisited, Visited);
+          Inc(FOwner.FTotalFiles, Visited);
+          Inc(FOwner.FProcessedBytes, Bytes);
+        finally
+          FOwner.FLock.Leave
+        end;
       finally
         Winapi.Windows.FindClose(Search)
       end;
     end;
+    if Subs <> nil then
+      for Sub in Subs do
+      begin
+        while WaitForSingleObject(Sub.Handle, 20) = WAIT_TIMEOUT do
+          if Cancelled then
+            Sub.RequestCancel;
+        if Cancelled then
+          Exit;
+        if Sub.FError <> '' then
+          raise Exception.Create(Sub.FError);
+        AdoptChanges(Sub);
+        ChildValues := Sub.FSubValues;
+        if Sub.FSubExisting and (Sub.FSubNode.Name <> Sub.FSubName) then
+          StageNode(Sub.FSubNode, Sub.FSubName, ChildValues, nil, True);
+        Inc(Result.Size, ChildValues.Size);
+        Inc(Result.LogicalSize, ChildValues.LogicalSize);
+        Inc(Result.Files, ChildValues.Files);
+      end;
     List.Sort(TComparer<TDiskNode>.Construct(
       function(const L, R: TDiskNode): Integer
       begin
@@ -826,6 +954,7 @@ begin
     else
       StageNode(Node, Node.Name, Result, nil, False);
   finally
+    Subs.Free; // Cancels and waits for sub-scans left behind by an early exit.
     if Existing then
       List.Free;
   end;
@@ -855,6 +984,7 @@ begin
     if GetVolumeInformation(PChar(P), VolName, Length(VolName), nil, Sectors, Bytes, nil, 0) then
       if VolName[0] <> #0 then
         Name := P + '  ' + string(VolName);
+  FFreeSlots := ParallelSlots(P);
   Result := ScanDirectory(Node, P, Cluster, 0, Existing);
   if Terminated then
     Exit;
@@ -1016,6 +1146,11 @@ begin
     try
       if Terminated then
         Exit;
+      if FOwner <> Self then
+      begin
+        FSubValues := ScanDirectory(FSubNode, FSubPath, FSubCluster, FSubDepth, FSubExisting);
+        Exit;
+      end;
       FRoot := TDiskNode.Create('', 'Summary');
       if FSourceRoot <> nil then
         FRoot.Children.OwnsObjects := False;
@@ -1072,6 +1207,8 @@ begin
     // timer while its retired-worker list is being reaped.
     if Terminated or ((FSourceRoot <> nil) and (FError <> '')) then
       DiscardResult;
+    if FOwner <> Self then
+      TInterlocked.Increment(FOwner.FFreeSlots);
     TInterlocked.Exchange(FDone, 1);
   end;
 end;
