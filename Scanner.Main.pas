@@ -252,6 +252,8 @@ type
     procedure SetChartView(const ID: string);
     procedure SetLanguage(const Language: string);
     property ChartViewID: string read FChartViewID;
+    procedure DragOver(const Data: TDragObject; const Point: TPointF; var Operation: TDragOperation); override;
+    procedure DragDrop(const Data: TDragObject; const Point: TPointF); override;
   protected
     procedure FocusNode(Node: TDiskNode; Remember: Boolean = True; Overview: Boolean = False);
     procedure OpenTarget(const Target: string; const Parameters: string = '');
@@ -1074,6 +1076,37 @@ begin
     FStartFolder := Folder;
     StartScan([Folder], Folder)
   end;
+end;
+
+function DroppedFolder(const Data: TDragObject): string;
+var
+  P: string;
+begin
+  // shortcut: only the first dropped folder is scanned, files are ignored.
+  for P in Data.Files do
+    if TDirectory.Exists(P) then
+      Exit(P);
+  Result := '';
+end;
+
+// The form, not the control under the cursor, accepts folders dropped from Explorer.
+procedure TFormMain.DragOver(const Data: TDragObject; const Point: TPointF; var Operation: TDragOperation);
+begin
+  inherited;
+  if DroppedFolder(Data) <> '' then
+    Operation := TDragOperation.Copy;
+end;
+
+procedure TFormMain.DragDrop(const Data: TDragObject; const Point: TPointF);
+var
+  Folder: string;
+begin
+  inherited;
+  Folder := DroppedFolder(Data);
+  if Folder = '' then
+    Exit;
+  FStartFolder := Folder;
+  StartScan([Folder], Folder);
 end;
 
 procedure TFormMain.SaveLog;
